@@ -400,19 +400,39 @@ void Ped::Tagent::move(double stepSizeIn)
   // }
 
   // calculate the new velocity
+    // === constant velocity override ===
   if (getTeleop() == false)
   {
+    // integrate acceleration normally
     v = v + stepSizeIn * a;
-    // ROS_WARN("update velocity %lf,%lf", v.x,v.y);
   }
 
-  // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
-  double speed = v.length();
-  if (speed > getVmax())
-    v = v.normalized() * sqrt(vmax * speed);
+  // for all non-robot agents, keep constant speed
+  if (getType() != Ped::Tagent::ROBOT)
+  {
+    double v_const = getVmax();
+    double speed = v.length();
 
-  // internal position update = actual move
+    // if velocity is near zero, give it a small random direction
+    if (speed < 1e-6)
+    {
+      double angle = ((double)rand() / RAND_MAX) * 2.0 * M_PI;
+      v = Ped::Tvector(cos(angle), sin(angle)) * v_const;
+    }
+    else
+    {
+      v = v.normalized() * v_const;
+    }
+
+    a = Ped::Tvector(0.0, 0.0);  // no acceleration
+  }
+
+  // integrate position
   p += stepSizeIn * v;
+
+  // notice scene of movement
+  scene->moveAgent(this);
+
 
   // notice scene of movement
   scene->moveAgent(this);
