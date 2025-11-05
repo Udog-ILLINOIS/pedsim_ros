@@ -403,7 +403,6 @@ void Ped::Tagent::move(double stepSizeIn)
   if (getTeleop() == false)
   {
     v = v + stepSizeIn * a;
-    // ROS_WARN("update velocity %lf,%lf", v.x,v.y);
   }
 
   // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
