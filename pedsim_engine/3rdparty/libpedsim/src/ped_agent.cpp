@@ -34,9 +34,14 @@ Ped::Tagent::Tagent()
   teleop = false;
 
   // assign random maximal speed in m/s
-  normal_distribution<double> distribution(0.6, 0.2);
-  vmax = distribution(generator);
+  // normal_distribution<double> distribution(0.6, 0.2);
+  // vmax = distribution(generator);
+  // vmaxDefault = vmax;
+
+  // setting  fixed max v 
+  vmax = 0.1;
   vmaxDefault = vmax;
+
   forceFactorDesired = 1.0;
   forceFactorSocial = 2.1;
   forceFactorObstacle = 10.0;
@@ -356,12 +361,13 @@ void Ped::Tagent::computeForces()
 
 const Ped::Tvector Ped::Tagent::getForce() const{
   return Ped::Tvector(
-    forceFactorDesired * desiredforce +
-    forceFactorSocial * socialforce +
-    forceFactorObstacle * obstacleforce +
-    myforce +
-    keepdistanceforce +
-    forceFactorRobot * robotforce
+    forceFactorDesired * desiredforce 
+    // +
+    // forceFactorSocial * socialforce +
+    // forceFactorObstacle * obstacleforce +
+    // myforce +
+    // keepdistanceforce +
+    // forceFactorRobot * robotforce
   );
 }
 
@@ -408,7 +414,7 @@ void Ped::Tagent::move(double stepSizeIn)
   // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
   double speed = v.length();
   if (speed > getVmax())
-    v = v.normalized() * sqrt(vmax * speed);
+  v = v.normalized() * vmax;
 
   // internal position update = actual move
   p += stepSizeIn * v;
