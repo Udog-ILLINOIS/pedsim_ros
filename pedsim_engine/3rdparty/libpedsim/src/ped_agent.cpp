@@ -319,7 +319,7 @@ Ped::Tvector Ped::Tagent::obstacleForce()
   double forceAmount = 10.0;
   if (distance > 0.0)
   {
-    forceAmount = 1.0 / distance;
+    forceAmount = 0.1 / distance*distance*distance*distance;
   }
   return forceAmount * minDiff.normalized();
 }
@@ -372,50 +372,110 @@ const Ped::Tvector Ped::Tagent::getForce() const{
 /// which is applied to the agents velocity, and then to its position.
 /// \param   stepSizeIn This tells the simulation how far the agent should
 /// proceed
+
+
+// old move function
+// void Ped::Tagent::move(double stepSizeIn)
+// {
+//   still_time += stepSizeIn;
+
+//   if(isForceOverridden){
+//     a = forceOverride;
+//   }
+//   else{
+//     // sum of all forces --> acceleration
+//     a = getForce();
+//   }
+
+//   // if (id == 1) {
+//   //   ROS_INFO("desiredforce: %lf, %lf, %lf", desiredforce.x, desiredforce.y, desiredforce.z);
+//   //   ROS_INFO("socialforce: %lf, %lf, %lf", socialforce.x, socialforce.y, socialforce.z);
+//   //   ROS_INFO("obstacleforce: %lf, %lf, %lf", obstacleforce.x, obstacleforce.y, obstacleforce.z);
+//   //   ROS_INFO("myforce: %lf, %lf, %lf", myforce.x, myforce.y, myforce.z);
+//   //   ROS_INFO("keepdistanceforce: %lf, %lf, %lf", keepdistanceforce.x, keepdistanceforce.y, keepdistanceforce.z);
+//   // }
+//   // ROS_INFO("stepSizeln%lf",stepSizeIn);
+
+//   // Added by Ronja Gueldenring
+//   // add robot force, so that pedestrians avoid robot
+//   // if (this->getType() == ADULT_AVOID_ROBOT || this->getType() == ADULT_AVOID_ROBOT_REACTION_TIME){
+//   // a = a + forceFactorSocial * robotforce;
+//   // }
+
+//   // calculate the new velocity
+//   if (getTeleop() == false)
+//   {
+//     v = v + stepSizeIn * a;
+//   }
+
+//   // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
+//   double speed = v.length();
+//   if (speed > getVmax())
+//     v = v.normalized() * sqrt(vmax * speed);
+
+//   // internal position update = actual move
+//   p += stepSizeIn * v;
+
+//   // notice scene of movement
+//   scene->moveAgent(this);
+// }
+
+// new move function (constant speed):
 void Ped::Tagent::move(double stepSizeIn)
 {
   still_time += stepSizeIn;
 
-  if(isForceOverridden){
-    a = forceOverride;
-  }
-  else{
-    // sum of all forces --> acceleration
-    a = getForce();
-  }
+  Ped::Tvector totalForce;
+  if (isForceOverridden)
+    totalForce = forceOverride;
+  else
+    totalForce = getForce();   // CHANGED: use forces only to define desired motion
 
-  // if (id == 1) {
-  //   ROS_INFO("desiredforce: %lf, %lf, %lf", desiredforce.x, desiredforce.y, desiredforce.z);
-  //   ROS_INFO("socialforce: %lf, %lf, %lf", socialforce.x, socialforce.y, socialforce.z);
-  //   ROS_INFO("obstacleforce: %lf, %lf, %lf", obstacleforce.x, obstacleforce.y, obstacleforce.z);
-  //   ROS_INFO("myforce: %lf, %lf, %lf", myforce.x, myforce.y, myforce.z);
-  //   ROS_INFO("keepdistanceforce: %lf, %lf, %lf", keepdistanceforce.x, keepdistanceforce.y, keepdistanceforce.z);
-  // }
-  // ROS_INFO("stepSizeln%lf",stepSizeIn);
-
-  // Added by Ronja Gueldenring
-  // add robot force, so that pedestrians avoid robot
-  // if (this->getType() == ADULT_AVOID_ROBOT || this->getType() == ADULT_AVOID_ROBOT_REACTION_TIME){
-  // a = a + forceFactorSocial * robotforce;
-  // }
-
-  // calculate the new velocity
   if (getTeleop() == false)
   {
-    v = v + stepSizeIn * a;
+    Ped::Tvector desiredVelocity(0.0, 0.0, 0.0);
+
+    // CHANGED: compute desired velocity from force direction
+    if (totalForce.length() > 1e-9)
+    {
+      Ped::Tvector desiredDir = totalForce.normalized();
+
+      // CHANGED: preferred cruising speed
+      double preferredSpeed = vmax;
+
+      // Optional: slow down a bit when very close to obstacles
+      if (obstacleforce.length() > 1.0)
+      {
+        preferredSpeed = 0.5 * vmax;
+      }
+
+      desiredVelocity = desiredDir * preferredSpeed;
+    }
+
+    // CHANGED: accelerate smoothly toward desired velocity
+    Ped::Tvector dv = desiredVelocity - v;
+
+    double maxAccel = 0.8; // m/s^2 or sim units/s^2, tune this
+    double maxDeltaV = maxAccel * stepSizeIn;
+
+    if (dv.length() > maxDeltaV)
+      dv = dv.normalized() * maxDeltaV;
+
+    v = v + dv;
+
+    // CHANGED: keep speed bounded
+    if (v.length() > vmax)
+      v = v.normalized() * vmax;
+
+    // CHANGED: kill tiny jitter on nearly straight paths
+    if (v.length() < 1e-4)
+      v = Ped::Tvector(0.0, 0.0, 0.0);
   }
 
-  // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
-  double speed = v.length();
-  if (speed > getVmax())
-    v = v.normalized() * sqrt(vmax * speed);
-
-  // internal position update = actual move
   p += stepSizeIn * v;
-
-  // notice scene of movement
   scene->moveAgent(this);
 }
+
 
 void Ped::Tagent::overrideForce(){
   isForceOverridden = false;
