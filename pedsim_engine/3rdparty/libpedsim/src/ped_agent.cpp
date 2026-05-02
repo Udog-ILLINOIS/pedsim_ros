@@ -35,18 +35,18 @@ Ped::Tagent::Tagent()
 
   // assign random maximal speed in m/s
   normal_distribution<double> distribution(0.6, 0.2);
-  vmax = distribution(generator);
+  vmax = 0.3;
   vmaxDefault = vmax;
   forceFactorDesired = 1.0;
   forceFactorSocial = 2.1;
-  forceFactorObstacle = 10.0;
+  forceFactorObstacle = 2.0;
   forceSigmaObstacle = 0.8;
   forceSigmaRobot = 0.3 * vmax / 0.4;
 
   agentRadius = 0.35;
-  relaxationTime = 0.5;
+  relaxationTime = 2.0;
   robotPosDiffScalingFactor = 5;
-  obstacleForceRange = 2.0;
+  obstacleForceRange = 0.75;
 
   keepDistanceForceDistanceDefault = 0.8;
   keepDistanceForceDistance = keepDistanceForceDistanceDefault;
@@ -319,7 +319,7 @@ Ped::Tvector Ped::Tagent::obstacleForce()
   double forceAmount = 10.0;
   if (distance > 0.0)
   {
-    forceAmount = 0.1 / distance*distance*distance*distance;
+    forceAmount = 1 / distance*distance*distance*distance;
   }
   return forceAmount * minDiff.normalized();
 }
@@ -358,10 +358,10 @@ const Ped::Tvector Ped::Tagent::getForce() const{
   return Ped::Tvector(
     forceFactorDesired * desiredforce +
     forceFactorSocial * socialforce +
-    forceFactorObstacle * obstacleforce +
+    //forceFactorObstacle * obstacleforce +
     myforce +
-    keepdistanceforce +
-    forceFactorRobot * robotforce
+    keepdistanceforce
+    //forceFactorRobot * robotforce
   );
 }
 
@@ -425,54 +425,89 @@ void Ped::Tagent::move(double stepSizeIn)
 {
   still_time += stepSizeIn;
 
-  Ped::Tvector totalForce;
   if (isForceOverridden)
-    totalForce = forceOverride;
+  {
+    a = forceOverride;
+  }
   else
-    totalForce = getForce();   // CHANGED: use forces only to define desired motion
+  {
+    a = getForce();
+  }
 
   if (getTeleop() == false)
   {
-    Ped::Tvector desiredVelocity(0.0, 0.0, 0.0);
+    double speed = v.length();
 
-    // CHANGED: compute desired velocity from force direction
-    if (totalForce.length() > 1e-9)
+    // If already moving, split acceleration into forward and turning parts
+    if (speed > 1e-6)
     {
-      Ped::Tvector desiredDir = totalForce.normalized();
+      Ped::Tvector vDir = v.normalized();
 
-      // CHANGED: preferred cruising speed
-      double preferredSpeed = vmax;
+      // Parallel acceleration changes speed
+      double aParallelMag = a.x * vDir.x + a.y * vDir.y + a.z * vDir.z;
+      Ped::Tvector aParallel = vDir * aParallelMag;
 
-      // Optional: slow down a bit when very close to obstacles
-      if (obstacleforce.length() > 1.0)
+      // Perpendicular acceleration changes heading
+      Ped::Tvector aPerp = a - aParallel;
+
+      // Tune these separately
+      double maxForwardAccel = 0.2;  // controls random speed-ups
+      double maxBrakeAccel   = 0.3;  // lets agent slow down faster than speeding up
+      double maxTurnAccel    = 0.75;  // controls turning responsiveness
+
+      // Clamp forward/backward acceleration separately
+      if (aParallelMag > maxForwardAccel)
       {
-        preferredSpeed = 0.5 * vmax;
+        aParallel = vDir * maxForwardAccel;
+      }
+      else if (aParallelMag < -maxBrakeAccel)
+      {
+        aParallel = vDir * (-maxBrakeAccel);
       }
 
-      desiredVelocity = desiredDir * preferredSpeed;
+      // Clamp turning acceleration
+      if (aPerp.length() > maxTurnAccel)
+      {
+        aPerp = aPerp.normalized() * maxTurnAccel;
+      }
+
+      // Recombine
+      a = aParallel + aPerp;
+    }
+    else
+    {
+      // If nearly stopped, there is no meaningful forward direction yet
+      double maxStartAccel = 0.8;
+
+      if (a.length() > maxStartAccel)
+      {
+        a = a.normalized() * maxStartAccel;
+      }
     }
 
-    // CHANGED: accelerate smoothly toward desired velocity
-    Ped::Tvector dv = desiredVelocity - v;
-
-    double maxAccel = 0.8; // m/s^2 or sim units/s^2, tune this
-    double maxDeltaV = maxAccel * stepSizeIn;
-
-    if (dv.length() > maxDeltaV)
-      dv = dv.normalized() * maxDeltaV;
-
-    v = v + dv;
-
-    // CHANGED: keep speed bounded
-    if (v.length() > vmax)
-      v = v.normalized() * vmax;
-
-    // CHANGED: kill tiny jitter on nearly straight paths
-    if (v.length() < 1e-4)
-      v = Ped::Tvector(0.0, 0.0, 0.0);
+    v = v + stepSizeIn * a;
   }
 
+  // Directly clamp speed to vmax
+  double speed = v.length();
+
+if (speed > getVmax())
+{
+  double maxClampDecel = 1.0; // tune this
+  double maxSpeedDrop = maxClampDecel * stepSizeIn;
+
+  double newSpeed = speed - maxSpeedDrop;
+
+  if (newSpeed < getVmax())
+  {
+    newSpeed = getVmax();
+  }
+
+  v = v.normalized() * newSpeed;
+}
+
   p += stepSizeIn * v;
+
   scene->moveAgent(this);
 }
 
