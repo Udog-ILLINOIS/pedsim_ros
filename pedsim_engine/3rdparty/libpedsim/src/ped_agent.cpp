@@ -13,11 +13,31 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <unordered_map>
 
 using namespace std;
 
 int Ped::Tagent::staticid = 0;
 default_random_engine generator;
+
+namespace
+{
+// File-local controller state.
+std::unordered_map<std::string, double> smoothedLateralCorrectionByAgent;
+
+struct ExternalRobotAvoidanceState
+{
+  int passingSide = 0;
+};
+
+std::unordered_map<std::string, ExternalRobotAvoidanceState>
+    externalRobotAvoidanceStateByAgent;
+
+double clampValue(double value, double minimum, double maximum)
+{
+  return std::max(minimum, std::min(value, maximum));
+}
+}
 
 /// Default Constructor
 Ped::Tagent::Tagent()
@@ -35,31 +55,44 @@ Ped::Tagent::Tagent()
 
   // assign random maximal speed in m/s
   normal_distribution<double> distribution(0.6, 0.2);
-  vmax = 0.3;
+  vmax = distribution(generator);
   vmaxDefault = vmax;
   forceFactorDesired = 1.0;
   forceFactorSocial = 2.1;
-  forceFactorObstacle = 2.0;
+  forceFactorObstacle = 10.0;
+
+  // Robot interactions remain disabled while the obstacle model is isolated.
+  forceFactorRobot = 0.0;
+
   forceSigmaObstacle = 0.8;
-  forceSigmaRobot = 0.3 * vmax / 0.4;
+  forceSigmaRobot = 0.3 * vmax / 0.4;  // retained for header/API compatibility
 
   agentRadius = 0.35;
-  relaxationTime = 2.0;
+  relaxationTime = 0.5;
   robotPosDiffScalingFactor = 5;
-  obstacleForceRange = 0.75;
+  obstacleForceRange = 2.0;
 
   keepDistanceForceDistanceDefault = 0.8;
   keepDistanceForceDistance = keepDistanceForceDistanceDefault;
   keepDistanceTo = Tvector(0.0, 0.0);
 
+  desiredforce = Ped::Tvector(0.0, 0.0);
+  socialforce = Ped::Tvector(0.0, 0.0);
   obstacleforce = Ped::Tvector(0.0, 0.0);
+  robotforce = Ped::Tvector(0.0, 0.0);
+  keepdistanceforce = Ped::Tvector(0.0, 0.0);
+  myforce = Ped::Tvector(0.0, 0.0);
 
   ROS_DEBUG("created agent with id: %s", id.c_str());
   // ROS_INFO("created agent with id: %s", "100");
 }
 
 /// Destructor
-Ped::Tagent::~Tagent() {}
+Ped::Tagent::~Tagent()
+{
+  smoothedLateralCorrectionByAgent.erase(id);
+  externalRobotAvoidanceStateByAgent.erase(id);
+}
 
 /// Assigns a Tscene to the agent. Tagent uses this to iterate over all
 /// obstacles and other agents in a scene.
@@ -132,10 +165,14 @@ double Ped::Tagent::keepDistanceForceFunction(double distance)
 Ped::Tvector Ped::Tagent::keepDistanceForce()
 {
   Tvector diff = p - keepDistanceTo;
+  if (diff.lengthSquared() <= 1e-12)
+  {
+    return Tvector(0.0, 0.0);
+  }
+
   Tvector direction = diff.normalized();
   double magnitude = keepDistanceForceFunction(diff.length());
-  Tvector force = direction * magnitude;
-  return force;
+  return direction * magnitude;
 }
 
 /// Calculates the force between this agent and the next assigned waypoint.
@@ -163,132 +200,93 @@ Ped::Tvector Ped::Tagent::desiredForce()
 
 /// Calculates the social force between this agent and all the other agents
 /// belonging to the same scene.
-/// It iterates over all agents inside the scene, has therefore the complexity
-/// O(N^2). A better
-/// agent storing structure in Tscene would fix this. But for small (less than
-/// 10000 agents) scenarios, this is just
-/// fine.
 /// \return  Tvector: the calculated force
 Ped::Tvector Ped::Tagent::socialForce() const
 {
-  // define relative importance of position vs velocity vector
-  // (set according to Moussaid-Helbing 2009)
+  // Moussaid-Helbing 2009 parameters.
   const double lambdaImportance = 2.0;
-
-  // define speed interaction
-  // (set according to Moussaid-Helbing 2009)
   const double gamma = 0.35;
-
-  // define speed interaction
-  // (set according to Moussaid-Helbing 2009)
-  const double n = 2;
-
-  // define angular interaction
-  // (set according to Moussaid-Helbing 2009)
-  const double n_prime = 3;
+  const double n = 2.0;
+  const double nPrime = 3.0;
+  const double eps = 1e-12;
 
   Tvector force(0.0, 0.0);
+
   for (const Ped::Tagent *other : neighbors)
   {
-    // don't compute social force to yourself
-    if (other->id == id)
-      continue;
-
-    // compute difference between both agents' positions
-    Tvector diff = other->p - p;
-
-    // if both agents have the exact same position disable social force to avoid division by zero
-    if (diff.lengthSquared() <= 0.001)
+    // Ignore yourself and ignore robots while robot interaction is disabled.
+    if (other->id == id || other->getType() == ROBOT)
     {
-      return Tvector(0.0, 0.0);
+      continue;
     }
 
-    if (other->getType() == ROBOT)
-      diff /= robotPosDiffScalingFactor;
+    Tvector diff = other->p - p;
+
+    // Skip a degenerate pair rather than disabling social forces from every
+    // remaining pedestrian for the entire update.
+    if (diff.lengthSquared() <= 0.001)
+    {
+      continue;
+    }
 
     Tvector diffDirection = diff.normalized();
-    int quadrant_before = diff.getQuadrant();
-    // shorten the diff vector by the model radiuses
+    int quadrantBefore = diff.getQuadrant();
+
+    // Measure approximate edge-to-edge separation.
     diff -= diffDirection * agentRadius;
     diff -= diffDirection * other->agentRadius;
-    int quadrant_after = diff.getQuadrant();
-    if (quadrant_before != quadrant_after)
+
+    if (quadrantBefore != diff.getQuadrant())
     {
-      // vector has changed direction i.e. models are already overlapping
-      // make diff length close to zero
+      // The agents overlap. Keep a small signed separation to avoid unstable
+      // behavior in the exponential model.
       diff = diffDirection * 0.01;
     }
 
-    // compute difference between both agents' velocity vectors
-    // Note: the agent-other-order changed here
-    Tvector velDiff = v - other->v;
-
-    // compute interaction direction t_ij
-    Tvector interactionVector = lambdaImportance * velDiff + diffDirection;
+    Tvector velocityDifference = v - other->v;
+    Tvector interactionVector =
+        lambdaImportance * velocityDifference + diffDirection;
     double interactionLength = interactionVector.length();
-    // assert(interactionLength > 0.0);
-    Tvector interactionDirection = interactionLength ? interactionVector : Ped::Tvector(1,0);
 
-    // The robots influence is computed separetly in Ped::Tagent::robotForce()
-    if (other->getType() == ROBOT)
+    if (interactionLength <= eps)
     {
       continue;
     }
-    else
+
+    Tvector interactionDirection = interactionVector / interactionLength;
+    Ped::Tangle theta = interactionDirection.angleTo(diffDirection);
+    double B = gamma * interactionLength;
+
+    if (B <= eps)
     {
-      // compute angle theta (between interaction and position difference vector)
-      Ped::Tangle theta = interactionDirection.angleTo(diffDirection);
-      // compute model parameter B = gamma * ||D||
-      double B = gamma * interactionLength;
-
-      double thetaRad = theta.toRadian();
-      double forceVelocityAmount =
-          -exp(-diff.length() / B -
-               (n_prime * B * thetaRad) * (n_prime * B * thetaRad));
-      double forceAngleAmount =
-          -theta.sign() *
-          exp(-diff.length() / B - (n * B * thetaRad) * (n * B * thetaRad));
-
-      Tvector forceVelocity = forceVelocityAmount * interactionDirection;
-      Tvector forceAngle =
-          forceAngleAmount * interactionDirection.leftNormalVector();
-      force += forceVelocity + forceAngle;
+      continue;
     }
+
+    double thetaRad = theta.toRadian();
+    double velocityAmount =
+        -std::exp(-diff.length() / B -
+                  (nPrime * B * thetaRad) * (nPrime * B * thetaRad));
+    double angleAmount =
+        -theta.sign() *
+        std::exp(-diff.length() / B -
+                 (n * B * thetaRad) * (n * B * thetaRad));
+
+    Tvector velocityForce = velocityAmount * interactionDirection;
+    Tvector angleForce =
+        angleAmount * interactionDirection.leftNormalVector();
+
+    force += velocityForce + angleForce;
   }
 
   return force;
 }
 
+// Retained only because robotForce() is declared in the class interface.
+// Robot force remains disabled while the obstacle response is isolated.
 Ped::Tvector Ped::Tagent::robotForce()
 {
-  Tvector force;
-  return force;
+  return Tvector(0.0, 0.0);
 }
-
-// // Added by Ronja Gueldenring
-// // Robot influences agents behaviour according the robot force
-// Ped::Tvector Ped::Tagent::robotForce(){
-//   double vel = sqrt(pow(this->getvx(),2) + pow(this->getvy(),2));
-//   if (vel > 0.1){
-//     still_time = 0.0;
-//   }
-
-//   Tvector force;
-//   for (const Ped::Tagent* other : neighbors) {
-//     if(other->getType() == ROBOT){
-//       // pedestrian is influenced robot force depending on the distance to the robot.
-//       Tvector diff = other->p - p;
-//       Tvector diffDirection = diff.normalized();
-//       double distanceSquared = diff.lengthSquared();
-//       double distance = sqrt(distanceSquared) - (agentRadius + 0.7);
-//       double forceAmount = -1.0 * exp(-distance / forceSigmaRobot);
-//       Tvector robot_force = forceAmount * diff.normalized();
-//       force += robot_force;
-//       break;
-//     }
-//   }
-//   return force;
-// }
 
 /// Calculates the force between this agent and the nearest obstacle in this
 /// scene.
@@ -296,41 +294,55 @@ Ped::Tvector Ped::Tagent::robotForce()
 /// \return  Tvector: the calculated force
 Ped::Tvector Ped::Tagent::obstacleForce()
 {
-  // obstacle which is closest only
-  Ped::Tvector minDiff;
-  double minDistanceSquared = INFINITY;
+  if (scene == nullptr || scene->obstacles.empty())
+  {
+    return Tvector(0.0, 0.0);
+  }
+
+  //should only respond to nearby obstacles
+  const double eps = 1e-9;
+  const double influenceRange = obstacleForceRange;  // edge-to-edge distance
+  const double minimumClearance = 0.10;
+  const double maximumContribution = 3.0;
+
+  Tvector totalForce(0.0, 0.0);
 
   for (const Tobstacle *obstacle : scene->obstacles)
   {
-    Ped::Tvector closestPoint = obstacle->closestPoint(p);
-    Ped::Tvector diff = p - closestPoint;
-    double distanceSquared = diff.lengthSquared(); // use squared distance to
-    // avoid computing square
-    // root
-    if (distanceSquared < minDistanceSquared)
+    Tvector closestPoint = obstacle->closestPoint(p);
+    Tvector awayFromObstacle = p - closestPoint;
+    double rawDistance = awayFromObstacle.length();
+
+    // closestPoint() can collapse onto the pedestrian position when geometry
+    // overlaps. A zero-length vector has no usable steering direction.
+    if (rawDistance <= eps)
     {
-      minDistanceSquared = distanceSquared;
-      minDiff = diff;
+      continue;
     }
+
+    double clearance = rawDistance - agentRadius;
+
+    // Ignore distant walls and other far-away scene geometry completely.
+    if (clearance >= influenceRange)
+    {
+      continue;
+    }
+
+    double safeClearance = std::max(clearance, minimumClearance);
+
+    // Smoothly reaches zero at influenceRange and remains bounded near walls.
+    double contribution =
+        (1.0 / safeClearance) - (1.0 / influenceRange);
+    contribution = std::max(0.0, contribution);
+    contribution = std::min(contribution, maximumContribution);
+
+    totalForce += contribution * (awayFromObstacle / rawDistance);
   }
 
-  double distance = sqrt(minDistanceSquared) - agentRadius;
-  // double forceAmount = exp(-distance / forceSigmaObstacle);
-  double forceAmount = 10.0;
-  if (distance > 0.0)
-  {
-    forceAmount = 1 / distance*distance*distance*distance;
-  }
-  return forceAmount * minDiff.normalized();
+  return totalForce;
 }
 
-/// myForce() is a method that returns an "empty" force (all components set to
-/// 0).
-/// This method can be overridden in order to define own forces.
-/// It is called in move() in addition to the other default forces.
-/// \return  Tvector: the calculated force
-/// \param   e is a vector defining the direction in which the agent wants to
-/// walk to.
+
 Ped::Tvector Ped::Tagent::myForce(Ped::Tvector e)
 {
   return Ped::Tvector(0.0, 0.0);
@@ -338,31 +350,27 @@ Ped::Tvector Ped::Tagent::myForce(Ped::Tvector e)
 
 void Ped::Tagent::computeForces()
 {
-  // update neighbors
-  // NOTE - have a config value for the neighbor range
   const double neighborhoodRange = 10.0;
   neighbors = scene->getNeighbors(p.x, p.y, neighborhoodRange);
 
-  // update forces
   desiredforce = desiredForce();
-  if (forceFactorSocial > 0)
-    socialforce = socialForce();
-  if (forceFactorObstacle > 0)
-    obstacleforce = obstacleForce();
-  robotforce = robotForce();
+  socialforce = (forceFactorSocial > 0.0)
+                    ? socialForce()
+                    : Tvector(0.0, 0.0);
+  obstacleforce = (forceFactorObstacle > 0.0)
+                      ? obstacleForce()
+                      : Tvector(0.0, 0.0);
+
+  
+  robotforce = Tvector(0.0, 0.0);
+
   keepdistanceforce = keepDistanceForce();
   myforce = myForce(desiredDirection);
 }
 
-const Ped::Tvector Ped::Tagent::getForce() const{
-  return Ped::Tvector(
-    forceFactorDesired * desiredforce +
-    forceFactorSocial * socialforce +
-    //forceFactorObstacle * obstacleforce +
-    myforce +
-    keepdistanceforce
-    //forceFactorRobot * robotforce
-  );
+const Ped::Tvector Ped::Tagent::getForce() const
+{
+  return forceFactorDesired * desiredforce;
 }
 
 /// Does the agent dynamics stuff. Calls the methods to calculate the individual
@@ -374,53 +382,210 @@ const Ped::Tvector Ped::Tagent::getForce() const{
 /// proceed
 
 
-// old move function
-// void Ped::Tagent::move(double stepSizeIn)
-// {
-//   still_time += stepSizeIn;
+Ped::Tvector Ped::Tagent::getFreshForce()
+{
+  const double neighborhoodRange = 10.0;
+  neighbors = scene->getNeighbors(p.x, p.y, neighborhoodRange);
 
-//   if(isForceOverridden){
-//     a = forceOverride;
-//   }
-//   else{
-//     // sum of all forces --> acceleration
-//     a = getForce();
-//   }
+  desiredforce = Tvector(0.0, 0.0);
+  socialforce = Tvector(0.0, 0.0);
+  obstacleforce = Tvector(0.0, 0.0);
+  robotforce = Tvector(0.0, 0.0);
+  myforce = Tvector(0.0, 0.0);
 
-//   // if (id == 1) {
-//   //   ROS_INFO("desiredforce: %lf, %lf, %lf", desiredforce.x, desiredforce.y, desiredforce.z);
-//   //   ROS_INFO("socialforce: %lf, %lf, %lf", socialforce.x, socialforce.y, socialforce.z);
-//   //   ROS_INFO("obstacleforce: %lf, %lf, %lf", obstacleforce.x, obstacleforce.y, obstacleforce.z);
-//   //   ROS_INFO("myforce: %lf, %lf, %lf", myforce.x, myforce.y, myforce.z);
-//   //   ROS_INFO("keepdistanceforce: %lf, %lf, %lf", keepdistanceforce.x, keepdistanceforce.y, keepdistanceforce.z);
-//   // }
-//   // ROS_INFO("stepSizeln%lf",stepSizeIn);
+  desiredforce = desiredForce();
 
-//   // Added by Ronja Gueldenring
-//   // add robot force, so that pedestrians avoid robot
-//   // if (this->getType() == ADULT_AVOID_ROBOT || this->getType() == ADULT_AVOID_ROBOT_REACTION_TIME){
-//   // a = a + forceFactorSocial * robotforce;
-//   // }
+  if (forceFactorSocial > 0.0)
+  {
+    socialforce = socialForce();
+  }
 
-//   // calculate the new velocity
-//   if (getTeleop() == false)
-//   {
-//     v = v + stepSizeIn * a;
-//   }
+  if (forceFactorObstacle > 0.0)
+  {
+    obstacleforce = obstacleForce();
+  }
 
-//   // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
-//   double speed = v.length();
-//   if (speed > getVmax())
-//     v = v.normalized() * sqrt(vmax * speed);
+  myforce = myForce(desiredDirection);
 
-//   // internal position update = actual move
-//   p += stepSizeIn * v;
+  // No robot force is calculated or applied in this isolated obstacle build.
+  return forceFactorDesired * desiredforce +
+         forceFactorSocial * socialforce +
+         forceFactorObstacle * obstacleforce +
+         myforce;
+}
 
-//   // notice scene of movement
-//   scene->moveAgent(this);
-// }
+bool Ped::Tagent::applyExternalRobotAvoidance(
+    const Ped::Tvector& robotPosition,
+    double stepSizeIn)
+{
+  const double eps = 1e-6;
+  const double detectionRange = 4.0;
+  const double releaseRange = 5.0;
+  const double behindReleaseDistance = 1.0;
+  const double sideDecisionThreshold = 0.15;
+  const double maxTurnRate = 1.40;  
+  const double lateralSmoothing = 0.22;
 
-// new move function (constant speed):
+  if (scene == nullptr || getTeleop())
+  {
+    externalRobotAvoidanceStateByAgent.erase(id);
+    return false;
+  }
+
+  Tvector toRobot = robotPosition - p;
+  double robotDistance = toRobot.length();
+
+  ExternalRobotAvoidanceState& bypassState =
+      externalRobotAvoidanceStateByAgent[id];
+
+  if (robotDistance > releaseRange)
+  {
+    externalRobotAvoidanceStateByAgent.erase(id);
+    return false;
+  }
+
+  // Match the previously successful simulator-level implementation:
+  // refresh forces and waypoint direction before deciding the bypass heading.
+  getFreshForce();
+
+  Tvector goalDirection(0.0, 0.0);
+
+  if (desiredDirection.length() > eps)
+  {
+    goalDirection = desiredDirection.normalized();
+  }
+  else if (v.length() > eps)
+  {
+    goalDirection = v.normalized();
+  }
+
+  if (goalDirection.length() <= eps)
+  {
+    externalRobotAvoidanceStateByAgent.erase(id);
+    return false;
+  }
+
+  double forwardDistance =
+      toRobot.x * goalDirection.x +
+      toRobot.y * goalDirection.y;
+
+  if (forwardDistance < behindReleaseDistance)
+  {
+    externalRobotAvoidanceStateByAgent.erase(id);
+    return false;
+  }
+
+  if (robotDistance > detectionRange && bypassState.passingSide == 0)
+  {
+    return false;
+  }
+
+  Tvector leftOfGoal = goalDirection.leftNormalVector();
+
+  double lateralOffset =
+      toRobot.x * leftOfGoal.x +
+      toRobot.y * leftOfGoal.y;
+
+  if (bypassState.passingSide == 0)
+  {
+    if (std::abs(lateralOffset) > sideDecisionThreshold)
+    {
+      // Robot on the left: pass on the right. Robot on the right: pass left.
+      bypassState.passingSide = (lateralOffset > 0.0) ? -1 : 1;
+    }
+    else
+    {
+      // Stable tie-breaker for a perfectly head-on encounter.
+      bypassState.passingSide = 1;
+    }
+  }
+
+  double proximity =
+      clampValue(
+          (detectionRange - robotDistance) / detectionRange,
+          0.0,
+          1.0);
+
+  // Keep normal social and wall steering active, but use only its lateral
+  // contribution so it cannot reverse the pedestrian.
+  Tvector standardAvoidance =
+      forceFactorSocial * socialforce +
+      forceFactorObstacle * obstacleforce +
+      myforce;
+
+  double standardLateral =
+      standardAvoidance.x * leftOfGoal.x +
+      standardAvoidance.y * leftOfGoal.y;
+
+  standardLateral =
+      clampValue(
+          lateralSmoothing * standardLateral,
+          -0.45,
+          0.45);
+
+  
+  double robotStrength =
+      (forceFactorRobot > 0.0) ? forceFactorRobot : 0.3;
+
+  double robotLateral =
+      robotStrength *
+      static_cast<double>(bypassState.passingSide) *
+      (0.65 + 1.20 * proximity);
+
+  Tvector targetDirection =
+      goalDirection +
+      leftOfGoal * (robotLateral + standardLateral);
+
+  if (targetDirection.length() > eps)
+  {
+    targetDirection = targetDirection.normalized();
+  }
+  else
+  {
+    targetDirection = goalDirection;
+  }
+
+  double speedScale = 1.0 - 0.25 * proximity;
+  double cruiseSpeed = 0.90 * vmaxDefault * speedScale;
+
+  if (v.length() > eps)
+  {
+    double currentAngle = std::atan2(v.y, v.x);
+    double targetAngle =
+        std::atan2(targetDirection.y, targetDirection.x);
+
+    double angleDiff = targetAngle - currentAngle;
+
+    while (angleDiff > M_PI)
+    {
+      angleDiff -= 2.0 * M_PI;
+    }
+
+    while (angleDiff < -M_PI)
+    {
+      angleDiff += 2.0 * M_PI;
+    }
+
+    double maxAngleStep = maxTurnRate * stepSizeIn;
+    angleDiff =
+        clampValue(angleDiff, -maxAngleStep, maxAngleStep);
+
+    double newAngle = currentAngle + angleDiff;
+
+    v = Tvector(std::cos(newAngle), std::sin(newAngle)) * cruiseSpeed;
+  }
+  else
+  {
+    v = targetDirection * cruiseSpeed;
+  }
+
+  a = Tvector(0.0, 0.0);
+  p += stepSizeIn * v;
+  scene->moveAgent(this);
+
+  return true;
+}
+
 void Ped::Tagent::move(double stepSizeIn)
 {
   still_time += stepSizeIn;
@@ -431,87 +596,145 @@ void Ped::Tagent::move(double stepSizeIn)
   }
   else
   {
-    a = getForce();
+    // Computes all forces and updates desiredDirection.
+    a = getFreshForce();
   }
 
   if (getTeleop() == false)
   {
-    double speed = v.length();
+    const double eps = 1e-6;
 
-    // If already moving, split acceleration into forward and turning parts
-    if (speed > 1e-6)
+    // Fixed walking speed. This avoids acceleration buildup.
+    const double cruiseSpeed = 0.90 * vmaxDefault;
+
+    // Turning control.
+    // Higher = tighter turns. Lower = smoother turns.
+    const double maxTurnRate = 1.2;  // rad/s
+
+    // Avoidance steering control.
+    // Keep this small. This should bend heading, not dominate it.
+    const double avoidanceScale = 0.18;
+    const double maxAvoidanceWeight = 0.60;
+
+    Ped::Tvector targetDir(0.0, 0.0);
+
+    if (desiredDirection.length() > eps)
     {
-      Ped::Tvector vDir = v.normalized();
+      Ped::Tvector goalDir = desiredDirection.normalized();
 
-      // Parallel acceleration changes speed
-      double aParallelMag = a.x * vDir.x + a.y * vDir.y + a.z * vDir.z;
-      Ped::Tvector aParallel = vDir * aParallelMag;
+      // Use ONLY non-desired forces for avoidance steering.
+      // Do not use desiredforce here, because that causes oscillation.
+      Ped::Tvector avoidance =
+        forceFactorSocial * socialforce +
+        forceFactorObstacle * obstacleforce +
+        myforce;
 
-      // Perpendicular acceleration changes heading
-      Ped::Tvector aPerp = a - aParallel;
+      // This movement model keeps a fixed walking speed. A forward or backward
+      // avoidance component cannot slow the pedestrian.  Keep
+      // only the component perpendicular to the waypoint direction.
+      Ped::Tvector leftOfGoal = goalDir.leftNormalVector();
+      double lateralAvoidance =
+          avoidance.x * leftOfGoal.x + avoidance.y * leftOfGoal.y;
 
-      // Tune these separately
-      double maxForwardAccel = 0.2;  // controls random speed-ups
-      double maxBrakeAccel   = 0.3;  // lets agent slow down faster than speeding up
-      double maxTurnAccel    = 0.75;  // controls turning responsiveness
-
-      // Clamp forward/backward acceleration separately
-      if (aParallelMag > maxForwardAccel)
+      const double lateralDeadband = 0.03;
+      if (std::abs(lateralAvoidance) < lateralDeadband)
       {
-        aParallel = vDir * maxForwardAccel;
-      }
-      else if (aParallelMag < -maxBrakeAccel)
-      {
-        aParallel = vDir * (-maxBrakeAccel);
+        lateralAvoidance = 0.0;
       }
 
-      // Clamp turning acceleration
-      if (aPerp.length() > maxTurnAccel)
+      double requestedCorrection = clampValue(
+          avoidanceScale * lateralAvoidance,
+          -maxAvoidanceWeight,
+          maxAvoidanceWeight);
+
+      // Smooth the correction so the pedestrian recenters gradually after clearing obstacle
+      const double steeringSmoothingTime = 0.22;  // seconds
+      double smoothingAlpha =
+          1.0 - std::exp(-stepSizeIn / steeringSmoothingTime);
+
+      double &smoothedCorrection = smoothedLateralCorrectionByAgent[id];
+      smoothedCorrection +=
+          smoothingAlpha * (requestedCorrection - smoothedCorrection);
+
+      if (std::abs(smoothedCorrection) < 1e-4)
       {
-        aPerp = aPerp.normalized() * maxTurnAccel;
+        smoothedCorrection = 0.0;
       }
 
-      // Recombine
-      a = aParallel + aPerp;
+      Ped::Tvector steeringCorrection = leftOfGoal * smoothedCorrection;
+      targetDir = goalDir + steeringCorrection;
+
+      if (targetDir.length() > eps)
+      {
+        targetDir = targetDir.normalized();
+      }
+      else
+      {
+        targetDir = goalDir;
+      }
     }
-    else
+    else if (v.length() > eps)
     {
-      // If nearly stopped, there is no meaningful forward direction yet
-      double maxStartAccel = 0.8;
-
-      if (a.length() > maxStartAccel)
-      {
-        a = a.normalized() * maxStartAccel;
-      }
+      targetDir = v.normalized();
+    }
+    else if (a.length() > eps)
+    {
+      targetDir = a.normalized();
     }
 
-    v = v + stepSizeIn * a;
+    if (targetDir.length() > eps)
+    {
+      if (v.length() > eps)
+      {
+        double currentAngle = std::atan2(v.y,               v.x);
+        double targetAngle = std::atan2(targetDir.y, targetDir.x);
+
+        double angleDiff = targetAngle - currentAngle;
+
+        while (angleDiff > M_PI)
+        {
+          angleDiff -= 2.0 * M_PI;
+        }
+
+        while (angleDiff < -M_PI)
+        {
+          angleDiff += 2.0 * M_PI;
+        }
+
+        double maxAngleStep = maxTurnRate * stepSizeIn;
+
+        if (angleDiff > maxAngleStep)
+        {
+          angleDiff = maxAngleStep;
+        }
+        else if (angleDiff < -maxAngleStep)
+        {
+          angleDiff = -maxAngleStep;
+        }
+
+        double newAngle = currentAngle + angleDiff;
+
+        v = Ped::Tvector(std::cos(newAngle), std::sin(newAngle)) * cruiseSpeed;
+      }
+      else
+      {
+        v = targetDir * cruiseSpeed;
+      }
+    }
+    else if (v.length() > eps)
+    {
+      v = v.normalized() * cruiseSpeed;
+    }
+
+    // Since this movement model uses force for steering, not acceleration,
+    // prevent acceleration spikes from being published.
+    a = Ped::Tvector(0.0, 0.0);
   }
-
-  // Directly clamp speed to vmax
-  double speed = v.length();
-
-if (speed > getVmax())
-{
-  double maxClampDecel = 1.0; // tune this
-  double maxSpeedDrop = maxClampDecel * stepSizeIn;
-
-  double newSpeed = speed - maxSpeedDrop;
-
-  if (newSpeed < getVmax())
-  {
-    newSpeed = getVmax();
-  }
-
-  v = v.normalized() * newSpeed;
-}
 
   p += stepSizeIn * v;
 
   scene->moveAgent(this);
 }
-
-
 void Ped::Tagent::overrideForce(){
   isForceOverridden = false;
 }

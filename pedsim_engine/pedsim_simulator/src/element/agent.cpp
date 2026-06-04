@@ -553,8 +553,37 @@ void Agent::move(double h) {
     } else if (state == AgentStateMachine::AgentState::StateBackUp){
       moveByMoveList();
     } else {
-      // normal movement
-      Ped::Tagent::move(h);
+      // Arena owns the robot pose. The reusable pedsim layer owns the actual
+      // committed-side avoidance behavior.
+      bool robotAvoidanceApplied = false;
+
+      if (SCENE.robot != nullptr && SCENE.robot != this) {
+        robotAvoidanceApplied =
+            applyExternalRobotAvoidance(SCENE.robot->getPosition(), h);
+      }
+
+      if (!robotAvoidanceApplied) {
+        for (auto robot : SCENE.getRobots()) {
+          auto robotState = robot->getState();
+
+          robotAvoidanceApplied =
+              applyExternalRobotAvoidance(
+                  Ped::Tvector(
+                      robotState.pose.position.x,
+                      robotState.pose.position.y,
+                      robotState.pose.position.z),
+                  h);
+
+          if (robotAvoidanceApplied) {
+            break;
+          }
+        }
+      }
+
+      if (!robotAvoidanceApplied) {
+        // normal movement
+        Ped::Tagent::move(h);
+      }
     }
     updateDirection();
   }

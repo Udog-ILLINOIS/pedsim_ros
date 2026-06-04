@@ -66,6 +66,13 @@ class LIBEXPORT Tagent {
   virtual Tvector obstacleForce();
   virtual Tvector myForce(Tvector desired);
   virtual Twaypoint* getCurrentWaypoint() const = 0;
+  virtual Tvector getFreshForce();
+
+  // Applies a committed-side robot bypass using a robot position supplied by
+  // the simulator layer. Returns true when this method handled movement for
+  // the current tick. The implementation lives in ped_agent.cpp.
+  bool applyExternalRobotAvoidance(const Tvector& robotPosition,
+                                   double stepSizeIn);
 
   virtual void setPosition(double px, double py, double pz = 0);
   virtual void setType(AgentType typeIn) { type = typeIn; };
