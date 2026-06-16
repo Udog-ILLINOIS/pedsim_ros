@@ -523,9 +523,11 @@ bool Ped::Tagent::applyExternalRobotAvoidance(
           -0.45,
           0.45);
 
-  
+  double forceFactorPassedParameter = 0.0;
+  ros::param::get("/force_factor", forceFactorPassedParameter);
+
   double robotStrength =
-      (forceFactorRobot > 0.0) ? forceFactorRobot : 0.3;
+      (forceFactorRobot > 0.0) ? forceFactorRobot : forceFactorPassedParameter;
 
   double robotLateral =
       robotStrength *
