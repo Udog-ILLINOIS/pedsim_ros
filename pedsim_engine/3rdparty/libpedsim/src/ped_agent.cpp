@@ -39,13 +39,13 @@ Ped::Tagent::Tagent()
   vmaxDefault = vmax;
   forceFactorDesired = 1.0;
   forceFactorSocial = 2.1;
-  forceFactorObstacle = 10.0;
+  forceFactorObstacle = 6.0;//10.0;
   forceSigmaObstacle = 0.8;
   forceSigmaRobot = 0.3 * vmax / 0.4;
 
   agentRadius = 0.35;
   relaxationTime = 0.5;
-  robotPosDiffScalingFactor = 5;
+  robotPosDiffScalingFactor = 2;//5;
   obstacleForceRange = 2.0;
 
   keepDistanceForceDistanceDefault = 0.8;
@@ -315,12 +315,12 @@ Ped::Tvector Ped::Tagent::obstacleForce()
   }
 
   double distance = sqrt(minDistanceSquared) - agentRadius;
-  // double forceAmount = exp(-distance / forceSigmaObstacle);
-  double forceAmount = 10.0;
-  if (distance > 0.0)
-  {
-    forceAmount = 1.0 / distance;
-  }
+  double forceAmount = exp(-distance / forceSigmaObstacle);
+  // double forceAmount = 10.0;
+  // if (distance > 0.0)
+  // {
+  //   forceAmount = 1.0 / distance;
+  // }
   return forceAmount * minDiff.normalized();
 }
 
@@ -403,12 +403,13 @@ void Ped::Tagent::move(double stepSizeIn)
   if (getTeleop() == false)
   {
     v = v + stepSizeIn * a;
+    // ROS_WARN("update velocity %lf,%lf", v.x,v.y);
   }
 
-  // don't exceed maximal speed, otherwise reduce to geometric mean for smoothness
+  // don't exceed maximal speed
   double speed = v.length();
-  if (speed > getVmax())
-    v = v.normalized() * sqrt(vmax * speed);
+  if (speed > vmax)
+    v = v.normalized() * vmax;
 
   // internal position update = actual move
   p += stepSizeIn * v;
@@ -424,8 +425,4 @@ void Ped::Tagent::overrideForce(){
 void Ped::Tagent::overrideForce(Ped::Tvector force){
   forceOverride = force;
   isForceOverridden = true;
-}
-
-void Ped::Tagent::overrideVmax(double factor_){
-  factorVmax = factor_;
 }
