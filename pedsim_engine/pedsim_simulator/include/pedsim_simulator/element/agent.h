@@ -133,6 +133,8 @@ class Agent : public ScenarioElement, public Ped::Tagent {
   bool addForce(Force* forceIn);
   bool removeForce(Force* forceIn);
   AgentStateMachine* getStateMachine() const;
+  std::string getSocialState() const;
+  void overrideSocialState(std::string state_);
   Ped::Tvector getDesiredDirection() const;
   Ped::Tvector getWalkingDirection() const;
   Ped::Tvector getSocialForce() const;
@@ -264,6 +266,9 @@ class Agent : public ScenarioElement, public Ped::Tagent {
   QList<Force*> forces;
   QStringList disabledForces;
   WaypointPlanner* waypointplanner;
+
+  bool isSocialStateOverridden;
+  std::string socialStateOverride;
 };
 
 #endif

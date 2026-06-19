@@ -494,6 +494,8 @@ bool SceneServices::addAgentClusterToPedsim(pedsim_msgs::Ped ped, std::vector<pe
       a->addWaypoint(w);
     }
 
+    a->configuration = ped.configuration;
+
     // add agent to scene
     SCENE.addAgent(a);
   }

@@ -176,8 +176,10 @@ class Scene : public QObject, protected Ped::Tscene {
   // wall cell locations
   std::vector<Location> wall_cells_;
 
-  std::vector<std::string> agent_types {"adult", "child", "elder", "forklift", "servicerobot", "robot"};
+  //TODO get this information dynamically
+  std::vector<std::string> agent_types {"human/adult", "human/elder", "human/child", "forklift", "servicerobot", "robot"};
   std::vector<float> agent_radius {0.5, 0.5, 0.5, 1.8, 1.0, 1.0};  // used for wall force calculation
+ 
   std::vector<std::string> wall_types {"areawaypoint", "pointwaypoint", "shelf"};
   std::vector<float> wall_radius {1.0, 1.0, 1.0};  // used for wall force calculation
   std::vector<std::string> start_up_modes {"default", "wait_timer", "trigger_zone"};

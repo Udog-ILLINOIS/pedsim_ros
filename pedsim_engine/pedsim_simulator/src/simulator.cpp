@@ -163,8 +163,7 @@ bool Simulator::initializeSimulation()
   bool env_is_flatland = true;
   std::string environment;
   nh_.param<std::string>("/simulator", environment, "flatland");
-  if (environment == "gazebo")
-    env_is_flatland = false;
+  env_is_flatland = environment == "flatland";
   // ROS_INFO("staticid in simulator.cpp: %d", Ped::Tagent::staticid);
 
   a->setType(Ped::Tagent::AgentType::ROBOT);
@@ -369,7 +368,7 @@ pedsim_msgs::AgentStates Simulator::getAgentStates()
     return gv;
   };
 
-  for (const Agent *a : SCENE.getAgents())
+  for (Agent *a : SCENE.getAgents())
   {
     // Skip robot.
     if (a->getType() == Ped::Tagent::ROBOT)
@@ -392,8 +391,7 @@ pedsim_msgs::AgentStates Simulator::getAgentStates()
     state.twist.linear.y = a->getvy();
     state.twist.linear.z = a->getvz();
 
-    AgentStateMachine::AgentState sc = a->getStateMachine()->getCurrentState();
-    state.social_state = agentStateToActivity(sc);
+    state.social_state = a->getSocialState();
 
     // Forces.
     pedsim_msgs::AgentForce agent_forces;
@@ -432,6 +430,8 @@ pedsim_msgs::AgentStates Simulator::getAgentStates()
       state.destination = VecToMsg(a->getCurrentDestination()->getPosition());
     }
     state.direction = a->facingDirection;
+
+    state.configuration = a->configuration;
 
     all_status.agent_states.push_back(state);
     // ROS_WARN("publish agent states %d,%lf, typeID,%d",state.id,state.twist.linear.x,state.type);
@@ -614,17 +614,16 @@ void Simulator::onPedsimAgents(pedsim_msgs::AgentFeedbacks agents){
     Agent* sceneAgent = SCENE.getAgent(agent.id);
     if(!sceneAgent) continue;
 
-    if(agent.unforce){
-      sceneAgent->overrideForce();
-    }
-    else{
-      sceneAgent->overrideForce(
-        Ped::Tvector(
-          agent.force.x,
-          agent.force.y,
-          agent.force.z
-        )
-      );
-    }
+    sceneAgent->overrideForce(
+      Ped::Tvector(
+        agent.force.x,
+        agent.force.y,
+        agent.force.z
+      )
+    );
+
+    sceneAgent->overrideVmax(agent.vmax);
+
+    sceneAgent->overrideSocialState(agent.social_state);
   }
 }

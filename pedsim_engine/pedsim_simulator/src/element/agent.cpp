@@ -636,6 +636,16 @@ bool Agent::removeForce(Force* forceIn) {
 
 AgentStateMachine* Agent::getStateMachine() const { return stateMachine; }
 
+std::string Agent::getSocialState() const {
+  if(isSocialStateOverridden) return socialStateOverride;
+  return AgentStateMachine::stateToName(stateMachine->getCurrentState()).toStdString();
+}
+
+void Agent::overrideSocialState(std::string state_){
+  isSocialStateOverridden = true;
+  socialStateOverride = state_;
+}
+
 WaypointPlanner* Agent::getWaypointPlanner() const { return waypointplanner; }
 
 void Agent::setWaypointPlanner(WaypointPlanner* plannerIn) {
