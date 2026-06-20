@@ -162,6 +162,10 @@ class LIBEXPORT Tagent {
 
   Ped::Tscene* scene;
 
+  // Subclasses can call this after directly modifying p to keep the spatial
+  // hash consistent. Defined in ped_agent.cpp where Tscene is complete.
+  void syncScenePosition();
+
   Ped::Tvector desiredDirection;
   set<const Ped::Tagent*> neighbors;
 
@@ -176,6 +180,12 @@ class LIBEXPORT Tagent {
   bool isForceOverridden = false;
 
   double factorVmax = 1.f;
+
+  // Set by the Agent layer when a global path sub-goal is active.
+  // move() and applyExternalRobotAvoidance() use this to override the
+  // waypoint direction produced by desiredForce().
+  Ped::Tvector pathSubGoal;
+  bool         hasPathSubGoal = false;
 };
 }
 #endif

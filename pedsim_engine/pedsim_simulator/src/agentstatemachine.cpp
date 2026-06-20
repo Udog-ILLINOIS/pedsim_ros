@@ -398,8 +398,8 @@ void AgentStateMachine::doStateTransition() {
     }
 
     if ((state == StateWalking || state == StateRunning) && agent->isStuck()) {
-      agent->updateDestination();
-      // don't check again for some time
+      // Replan to the current destination. Do NOT advance to next destination —
+      // skipping waypoints mid-journey causes all agents to U-turn simultaneously.
       agent->lastIsStuckCheck = agent->lastIsStuckCheck + ros::Duration(10.0);
       activateState(StateWalking);
       return;
@@ -407,17 +407,15 @@ void AgentStateMachine::doStateTransition() {
 
     // ## do some checks wether to interrupt walking
 
-    // → switch to running sometimes
-    if (state == StateWalking && agent->switchRunningWalking()) {
-      activateState(StateRunning);
-      return;
-    }
-
-    // → switch to running sometimes
-    if (state == StateRunning && agent->switchRunningWalking()) {
-      activateState(StateWalking);
-      return;
-    }
+    // Running disabled during debugging — agents stay in Walking only.
+    // if (state == StateWalking && agent->switchRunningWalking()) {
+    //   activateState(StateRunning);
+    //   return;
+    // }
+    // if (state == StateRunning && agent->switchRunningWalking()) {
+    //   activateState(StateWalking);
+    //   return;
+    // }
 
     // → start telling a story sometimes
     if (state == StateWalking && agent->tellStory()) {
@@ -617,6 +615,9 @@ void AgentStateMachine::doStateTransition() {
 void AgentStateMachine::activateState(AgentState stateIn) {
   // if (agent->id == 1) ROS_INFO("Agent %s type %d activating state '%s' (time: %f)", agent->getId().c_str(), agent->getType(), stateToName(stateIn).toStdString().c_str(), SCENE.getTime());
 
+  // Save before deactivation so StateWalking can decide whether to replan.
+  AgentState previousState = state;
+
   // de-activate old state
   deactivateState(state);
 
@@ -652,9 +653,18 @@ void AgentStateMachine::activateState(AgentState stateIn) {
       agent->setWaypointPlanner(individualPlanner);
       agent->resumeMovement();
       agent->setVmax(agent->vmaxDefault);
-      // agent->disableForce("KeepDistance");
-      // agent->disableForce("Robot");
-      // TODO parametrize this
+      if (destination != nullptr) {
+        // Running→Walking is only a speed change; the existing path is still
+        // valid. Replanning from inside a tight area would route backward
+        // (180-degree turn) because the start gets snapped outside the
+        // narrow zone. All other transitions need a fresh plan.
+        bool keepPath = (previousState == StateRunning) &&
+                        agent->hasActivePath();
+        if (!keepPath)
+          agent->planAndSetPath(destination->getPosition());
+      } else {
+        agent->clearPath();
+      }
       break;
     case StateDriving:
       if (individualPlanner == nullptr)

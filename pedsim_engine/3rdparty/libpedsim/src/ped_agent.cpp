@@ -24,6 +24,8 @@ namespace
 {
 // File-local controller state.
 std::unordered_map<std::string, double> smoothedLateralCorrectionByAgent;
+std::unordered_map<std::string, double> smoothedProximityFactorByAgent;
+std::unordered_map<std::string, double> currentHeadingByAgent;
 
 struct ExternalRobotAvoidanceState
 {
@@ -58,8 +60,8 @@ Ped::Tagent::Tagent()
   vmax = distribution(generator);
   vmaxDefault = vmax;
   forceFactorDesired = 1.0;
-  forceFactorSocial = 2.1;
-  forceFactorObstacle = 10.0;
+  forceFactorSocial = 4.0;
+  forceFactorObstacle = 0.0;
 
   // Robot interactions remain disabled while the obstacle model is isolated.
   forceFactorRobot = 0.0;
@@ -70,7 +72,7 @@ Ped::Tagent::Tagent()
   agentRadius = 0.35;
   relaxationTime = 0.5;
   robotPosDiffScalingFactor = 5;
-  obstacleForceRange = 2.0;
+  obstacleForceRange = 1.0;
 
   keepDistanceForceDistanceDefault = 0.8;
   keepDistanceForceDistance = keepDistanceForceDistanceDefault;
@@ -91,6 +93,8 @@ Ped::Tagent::Tagent()
 Ped::Tagent::~Tagent()
 {
   smoothedLateralCorrectionByAgent.erase(id);
+  smoothedProximityFactorByAgent.erase(id);
+  currentHeadingByAgent.erase(id);
   externalRobotAvoidanceStateByAgent.erase(id);
 }
 
@@ -462,6 +466,14 @@ bool Ped::Tagent::applyExternalRobotAvoidance(
   // refresh forces and waypoint direction before deciding the bypass heading.
   getFreshForce();
 
+  // Let the global path planner steer toward sub-goals rather than raw waypoints.
+  if (hasPathSubGoal)
+  {
+    Tvector toSubGoal = pathSubGoal - p;
+    if (toSubGoal.length() > eps)
+      desiredDirection = toSubGoal;
+  }
+
   Tvector goalDirection(0.0, 0.0);
 
   if (desiredDirection.length() > eps)
@@ -605,31 +617,103 @@ void Ped::Tagent::move(double stepSizeIn)
 {
   still_time += stepSizeIn;
 
+  // Always compute fresh forces so desiredDirection, socialforce, and
+  // obstacleforce are current. The passthrough SFM feeds back the same forces
+  // via overrideForce(), setting isForceOverridden=true every tick, which
+  // previously skipped getFreshForce() and froze desiredDirection — causing
+  // agents to steer toward a stale (often wall-pointing) direction.
+  // a is zeroed at the end of move() regardless, so the override only affects
+  // the published acceleration and has no effect on actual position.
+  a = getFreshForce();
   if (isForceOverridden)
   {
     a = forceOverride;
   }
-  else
+
+  // Always steer toward the path sub-goal. Must be outside the override
+  // branch so it runs even when passthrough has set isForceOverridden=true.
+  if (hasPathSubGoal)
   {
-    // Computes all forces and updates desiredDirection.
-    a = getFreshForce();
+    Tvector toSubGoal = pathSubGoal - p;
+    if (toSubGoal.length() > 1e-6)
+      desiredDirection = toSubGoal;
   }
 
   if (getTeleop() == false)
   {
     const double eps = 1e-6;
 
+    // Two independent slowdown triggers share the same neighbor loop.
+    double proximityFactor = 1.0;
+    for (const Ped::Tagent* other : neighbors) {
+      if (other->id == id || other->getType() == ROBOT) continue;
+      Tvector diff     = other->p - p;
+      double  dist     = diff.length();
+      if (dist < 1e-6) continue;
+      double  edgeDist = dist - agentRadius - other->agentRadius;
+      if (edgeDist >= 2.0) continue;
+
+      Tvector diffDir = diff / dist;
+      double  vLen    = v.length();
+
+      // ── Trigger A: converging encounters (head-on, crossing) ─────────────
+      // Only fires when gap is closing AND other is in the forward hemisphere.
+      // Slowing for side/rear agents keeps us in the conflict zone longer.
+      // Range kept at 1.2m — earlier braking for head-on at 2m is too jumpy.
+      if (edgeDist < 1.2) {
+        double closingSpeed = Tvector::dotProduct(v - other->v, diffDir);
+        if (closingSpeed > 0.0 && vLen > eps &&
+            Tvector::dotProduct(v / vLen, diffDir) > 0.0) {
+          double approachFrac = std::min(1.0, closingSpeed / vmaxDefault);
+          double t            = std::max(0.0, edgeDist / 1.2);
+          double maxSlowdown  = 0.35 + 0.65 * t;
+          double factor       = maxSlowdown + (1.0 - maxSlowdown) * (1.0 - approachFrac);
+          proximityFactor     = std::min(proximityFactor, factor);
+        }
+      }
+
+      // ── Trigger B: same-direction following ───────────────────────────────
+      // Closing speed is zero when speeds match, so trigger A never fires for
+      // steady-state bunching. This trigger enforces a 2m natural following gap
+      // independently of closing speed. inFront > 0.7 (~45°) ensures the other
+      // is directly ahead; sameDir > 0.5 (~60°) filters counter-flow/crossing.
+      if (vLen > eps) {
+        Tvector vDir      = v / vLen;
+        double  inFront   = Tvector::dotProduct(vDir, diffDir);
+        double  otherVLen = other->v.length();
+        double  sameDir   = (otherVLen > eps)
+                              ? Tvector::dotProduct(vDir, other->v / otherVLen)
+                              : 0.0;
+        if (inFront > 0.5 && sameDir > 0.5) {
+          double t      = edgeDist / 2.0;
+          double factor = 0.55 + 0.45 * t;  // 0.55 at contact → 1.0 at 2.0m
+          proximityFactor = std::min(proximityFactor, factor);
+        }
+      }
+    }
+
+    // Smooth the raw proximity factor over time so speed ramps up/down
+    // gradually rather than stepping between discrete levels each frame.
+    {
+      const double proxSmoothTime = 0.30;  // seconds — tune for feel
+      double alpha = 1.0 - std::exp(-stepSizeIn / proxSmoothTime);
+      double &sp   = smoothedProximityFactorByAgent[id];
+      if (sp == 0.0) sp = 1.0;  // initialise on first use
+      sp += alpha * (proximityFactor - sp);
+      proximityFactor = sp;
+    }
+
     // Fixed walking speed. This avoids acceleration buildup.
-    const double cruiseSpeed = 0.90 * vmaxDefault;
+    const double cruiseSpeed = 0.90 * vmaxDefault * proximityFactor;
 
     // Turning control.
     // Higher = tighter turns. Lower = smoother turns.
-    const double maxTurnRate = 1.2;  // rad/s
+    const double maxTurnRate = 1.0;  // rad/s
 
     // Avoidance steering control.
     // Keep this small. This should bend heading, not dominate it.
-    const double avoidanceScale = 0.18;
-    const double maxAvoidanceWeight = 0.60;
+    const double avoidanceScale = 0.40;
+    const double maxAvoidanceWeight = 0.85;
 
     Ped::Tvector targetDir(0.0, 0.0);
 
@@ -665,7 +749,7 @@ void Ped::Tagent::move(double stepSizeIn)
 
       // Smooth the correction so the pedestrian recenters gradually after
       // clearing an obstacle instead of snapping across the waypoint heading.
-      const double steeringSmoothingTime = 0.22;  // seconds
+      const double steeringSmoothingTime = 0.40;  // seconds
       double smoothingAlpha =
           1.0 - std::exp(-stepSizeIn / steeringSmoothingTime);
 
@@ -701,42 +785,29 @@ void Ped::Tagent::move(double stepSizeIn)
 
     if (targetDir.length() > eps)
     {
+      double targetAngle = std::atan2(targetDir.y, targetDir.x);
+
+      // Per-agent stored heading: bridges the v≈0 case so the rate limiter
+      // always has a meaningful previous angle to limit from. Without this,
+      // the stopped branch would snap instantly to targetDir on restart.
+      double& storedAngle = currentHeadingByAgent[id];
+      double currentAngle = (v.length() > eps)
+                              ? std::atan2(v.y, v.x)
+                              : storedAngle;
       if (v.length() > eps)
-      {
-        double currentAngle = std::atan2(v.y,               v.x);
-        double targetAngle = std::atan2(targetDir.y, targetDir.x);
+        storedAngle = currentAngle;  // keep stored in sync while moving
 
-        double angleDiff = targetAngle - currentAngle;
+      double angleDiff = targetAngle - currentAngle;
+      while (angleDiff >  M_PI) angleDiff -= 2.0 * M_PI;
+      while (angleDiff < -M_PI) angleDiff += 2.0 * M_PI;
 
-        while (angleDiff > M_PI)
-        {
-          angleDiff -= 2.0 * M_PI;
-        }
+      double maxAngleStep = maxTurnRate * stepSizeIn;
+      angleDiff = clampValue(angleDiff, -maxAngleStep, maxAngleStep);
 
-        while (angleDiff < -M_PI)
-        {
-          angleDiff += 2.0 * M_PI;
-        }
+      double newAngle = currentAngle + angleDiff;
+      storedAngle = newAngle;
 
-        double maxAngleStep = maxTurnRate * stepSizeIn;
-
-        if (angleDiff > maxAngleStep)
-        {
-          angleDiff = maxAngleStep;
-        }
-        else if (angleDiff < -maxAngleStep)
-        {
-          angleDiff = -maxAngleStep;
-        }
-
-        double newAngle = currentAngle + angleDiff;
-
-        v = Ped::Tvector(std::cos(newAngle), std::sin(newAngle)) * cruiseSpeed;
-      }
-      else
-      {
-        v = targetDir * cruiseSpeed;
-      }
+      v = Ped::Tvector(std::cos(newAngle), std::sin(newAngle)) * cruiseSpeed;
     }
     else if (v.length() > eps)
     {
@@ -763,4 +834,8 @@ void Ped::Tagent::overrideForce(Ped::Tvector force){
 
 void Ped::Tagent::overrideVmax(double factor_){
   factorVmax = factor_;
+}
+
+void Ped::Tagent::syncScenePosition() {
+  if (scene) scene->moveAgent(this);
 }

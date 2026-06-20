@@ -31,6 +31,7 @@ set(CMAKE_AUTOUIC ON)
 find_package(catkin REQUIRED COMPONENTS ${PEDSIM_SIMULATOR_DEPENDENCIES})
 find_package(Boost REQUIRED)
 find_package(Qt5Widgets REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
 
 # dynamic reconfigure parameters
 generate_dynamic_reconfigure_options(config/PedsimSimulator.cfg)
@@ -56,6 +57,7 @@ set(SOURCES
 	src/rng.cpp
 	src/scene_services.cpp
 	src/agent_pose_stamped.cpp
+	src/pedestrian_planner.cpp
 
 	# elements
 	src/element/agent.cpp
@@ -131,6 +133,7 @@ target_link_libraries(
   ${BOOST_LIBRARIES}
   ${catkin_LIBRARIES}
   ${YAMLCPP_LIBRARIES}
+  ${OpenCV_LIBRARIES}
 )
 
 add_executable(simulate_diff_drive_robot src/simulate_diff_drive_robot.cpp)

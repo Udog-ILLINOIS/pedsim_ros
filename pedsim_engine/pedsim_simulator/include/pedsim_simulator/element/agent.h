@@ -32,6 +32,7 @@
 #ifndef _agent_h_
 #define _agent_h_
 
+#include <deque>
 #include <pedsim/types.h>
 #include <pedsim/ped_agent.h>
 #include <pedsim_simulator/element/scenarioelement.h>
@@ -169,6 +170,11 @@ class Agent : public ScenarioElement, public Ped::Tagent {
   bool waitTimeExpired();
   bool robotInTriggerZone();
 
+  // global path planner
+  void planAndSetPath(const Ped::Tvector& goal);
+  void clearPath();
+  bool hasActivePath() const { return !pathQueue_.empty(); }
+
   // misc
   void disableForce(const QString& forceNameIn);
   void enableForce(const QString& forceNameIn);
@@ -269,6 +275,8 @@ class Agent : public ScenarioElement, public Ped::Tagent {
 
   bool isSocialStateOverridden;
   std::string socialStateOverride;
+
+  std::deque<Ped::Tvector> pathQueue_;
 };
 
 #endif
