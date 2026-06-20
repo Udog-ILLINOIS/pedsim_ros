@@ -789,7 +789,7 @@ void Ped::Tagent::move(double stepSizeIn)
 
       // Per-agent stored heading: bridges the v≈0 case so the rate limiter
       // always has a meaningful previous angle to limit from. Without this,
-      // the stopped branch would snap instantly to targetDir on restart.
+      // the stopped branch would snap instantly to targetDir on restart. //
       double& storedAngle = currentHeadingByAgent[id];
       double currentAngle = (v.length() > eps)
                               ? std::atan2(v.y, v.x)
