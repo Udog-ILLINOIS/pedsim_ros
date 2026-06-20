@@ -1,3 +1,4 @@
 string id
 geometry_msgs/Vector3 force
-bool unforce
+string social_state
+float64 vmax

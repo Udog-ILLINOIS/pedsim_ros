@@ -1,29 +1,27 @@
-import dataclasses
 from enum import Enum
 from typing import Dict, Type
-import genpy
 
-from pedsim_agents.config import Topics
-from pedsim_agents.utils import InputData, FeedbackDatum, FeedbackData, FeedbackMsg
+from pedsim_agents.utils import InData, WorkData
 import rospy
 
-class ForcemodelName(Enum):
-    PASSTHROUGH = "passthrough"
-    SPINNY = "spinny"
-    PYSOCIAL = "pysocial"
-    DEEPSOCIALFORCE = "deepsocialforce"
-    EVACUATION = "evacuation"
-
 class Forcemodel:
-    def callback(self, data: InputData) -> FeedbackData:
+
+    class Name(Enum):
+        PASSTHROUGH = "passthrough"
+        SPINNY = "spinny"
+        PYSOCIAL = "pysocial"
+        DEEPSOCIALFORCE = "deepsocialforce"
+        EVACUATION = "evacuation"
+
+    def compute(self, in_data: InData, work_data: WorkData):
         raise NotImplementedError()
 
-class PedsimForcemodel:
+class Forcemodels:
 
-    __registry: Dict[ForcemodelName, Type[Forcemodel]] = dict()
+    __registry: Dict[Forcemodel.Name, Type[Forcemodel]] = dict()
 
     @classmethod
-    def register(cls, name: ForcemodelName):
+    def register(cls, name: Forcemodel.Name):
         def inner(force_model: Type[Forcemodel]):
             if cls.__registry.get(name) is not None:
                 raise NameError(f"force model {name} is already registered")
@@ -32,7 +30,7 @@ class PedsimForcemodel:
             return force_model
         return inner
 
-    forcemodel_name: ForcemodelName
+    forcemodel_name: Forcemodel.Name
     forcemodel_class: Type[Forcemodel]
     forcemodel: Forcemodel
 
@@ -42,9 +40,9 @@ class PedsimForcemodel:
     def __init__(self, name: str):
 
         try:
-            forcemodel_name = ForcemodelName(name)
+            forcemodel_name = Forcemodel.Name(name)
         except ValueError as e:
-            raise ValueError(f"Force model {name} does not exist.\nAvailable force models: {[name.value for name in ForcemodelName]}") from e
+            raise ValueError(f"Force model {name} does not exist.\nAvailable force models: {[name.value for name in Forcemodel.Name]}") from e
 
         self.forcemodel_name = forcemodel_name
 
@@ -54,12 +52,6 @@ class PedsimForcemodel:
             raise RuntimeError(f"Force model {forcemodel_name.value} has no registered implementation.\nImplemented force models: {[name.value for name in self.__registry.keys()]}")
 
         self.forcemodel_class = forcemodel_class
-
-        self.publisher = rospy.Publisher(
-            name=Topics.FEEDBACK,
-            data_class=FeedbackMsg,
-            queue_size=1
-        )
 
         self.running = False
 
@@ -78,14 +70,7 @@ class PedsimForcemodel:
         
         self.running = True
 
-    def calculate(self, data: InputData) -> FeedbackData:
-        if len(data.agents) == 0:
-            return []
-        
-        return self.forcemodel.callback(data)
-    
-    def publish(self, stamp: genpy.Time, data: FeedbackData):
-        msg = FeedbackMsg()
-        msg.header.stamp = stamp
-        msg.agents = [datum.feedback for datum in data]
-        self.publisher.publish(msg)
+    def run(self, in_data: InData, work_data: WorkData):
+
+        if len(in_data.agents) == 0: return
+        return self.forcemodel.compute(in_data=in_data, work_data=work_data)

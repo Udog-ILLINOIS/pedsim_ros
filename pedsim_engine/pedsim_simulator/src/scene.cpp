@@ -464,11 +464,13 @@ bool Scene::removeWall(Wall* wall) {
   // don't keep track of obstacle anymore
   walls.removeAll(wall);
 
+  // actually remove it
+  if(!Ped::Tscene::removeObstacle(wall))
+    return false;
+
   // inform users
   emit wallRemoved(wall->getid());
-
-  // actually remove it
-  return Ped::Tscene::removeObstacle(wall);
+  return true;
 }
 
 bool Scene::removeObstacle(Obstacle* obstacle) {

@@ -29,9 +29,12 @@
 * \author Sven Wehner <mail@svenwehner.de>
 */
 
+#include <fstream>
+#include <cstdio>
 #include <pedsim_simulator/agentstatemachine.h>
 #include <pedsim_simulator/config.h>
 #include <pedsim_simulator/element/agent.h>
+#include <pedsim_simulator/pedestrian_planner.h>
 #include <pedsim_simulator/element/robot.h>
 #include <pedsim_simulator/element/waypoint.h>
 #include <pedsim_simulator/force/force.h>
@@ -39,6 +42,13 @@
 #include <pedsim_simulator/waypointplanner/waypointplanner.h>
 #include <pedsim_simulator/rng.h>
 #include <ros/ros.h>
+#include <unordered_map>
+
+// Consecutive path-failure counter per agent. When a goal is unreachable
+// for kMaxPathFailures replans in a row, the agent skips to its next
+// waypoint rather than idling against an impassable destination forever.
+static std::unordered_map<std::string, int> pathFailCountByAgent;
+static constexpr int kMaxPathFailures = 1;
 
 Agent::Agent() {
   Ped::Tagent::setType(Ped::Tagent::ADULT);
@@ -536,6 +546,9 @@ void Agent::move(double h) {
       Ped::Tagent::move(h);
     }
   } else {
+    // Save position before any movement for the post-move wall clamp.
+    Ped::Tvector preMovePos = p;
+
     // special cases for some states
     auto state = stateMachine->getCurrentState();
     if (state == AgentStateMachine::AgentState::StateListeningAndWalking) {
@@ -553,9 +566,78 @@ void Agent::move(double h) {
     } else if (state == AgentStateMachine::AgentState::StateBackUp){
       moveByMoveList();
     } else {
-      // normal movement
+      // Advance the global path queue and expose the current sub-goal so that
+      // move() steers toward it instead of the final waypoint. Pop in a loop
+      // so all "already passed" cells are consumed in a single tick — this
+      // keeps the effective look-ahead at ~0.4 m regardless of cell density.
+      while (!pathQueue_.empty() &&
+             (pathQueue_.front() - p).length() < PedestrianPlanner::kSubGoalLookahead)
+        pathQueue_.pop_front();
+      if (!pathQueue_.empty()) {
+        pathSubGoal    = pathQueue_.front();
+        hasPathSubGoal = true;
+      }
+      // When the queue empties we deliberately keep hasPathSubGoal = true so
+      // the agent continues steering toward the last A*-snapped cell rather
+      // than falling back to raw waypoint direction, which can point straight
+      // through a wall when the scenario waypoint sits inside the buffer zone.
+      // hasPathSubGoal is cleared only by clearPath() and planAndSetPath().
+
+      // Robot avoidance temporarily disabled.
       Ped::Tagent::move(h);
     }
+
+    // Hard wall constraint: if any movement landed the agent inside an
+    // occupied map cell, slide back or revert. This is a catch-all safety net
+    // on top of the path planner — social forces can still nudge agents off
+    // the planned path, so we enforce the physical boundary here.
+    PedestrianPlanner& planner = PedestrianPlanner::instance();
+    if (planner.isReady()) {
+      Ped::Tvector clamped = planner.clampToFreeSpace(preMovePos, p);
+      if ((clamped - p).lengthSquared() > 1e-12) {
+        // Full revert (clamped == preMovePos): agent is cornered on both axes —
+        // zero velocity so the next tick's steering can pick a new direction.
+        // Partial slide (clamped != preMovePos): agent can still move along one
+        // axis — keep velocity so it continues rather than freezing in place.
+        bool isFullRevert = ((clamped - preMovePos).lengthSquared() < 1e-12);
+        p = clamped;
+        if (isFullRevert) {
+          v = Ped::Tvector(0.0, 0.0, 0.0);
+        }
+        syncScenePosition();
+      }
+    }
+
+    // Hard agent-agent exclusion: prevent pedestrians from penetrating each
+    // other. kPedPedGap is extra edge-to-edge clearance on top of the two
+    // physical radii — increase it to enforce a larger personal-space bubble.
+    // This is position-level, not force-based: the agent simply cannot move
+    // closer than (2*radius + kPedPedGap) to another pedestrian.
+    {
+      const double kPedPedGap = 0.0;  // m extra edge clearance — tune here
+      bool anyExclusion = false;
+      for (const Ped::Tagent* other : neighbors) {
+        if (other->id == id || other->getType() == ROBOT) continue;
+        Ped::Tvector otherPos = other->getPosition();
+        Ped::Tvector toOther  = otherPos - p;
+        double dist           = toOther.length();
+        double minDist        = 2.0 * agentRadius + kPedPedGap;
+        if (dist < minDist && dist > 1e-6) {
+          p = otherPos - toOther.normalized() * minDist;
+          anyExclusion = true;
+        }
+      }
+      // Re-apply wall clamp: the exclusion above can push the agent into a
+      // wall since it runs after the first clamp. Without this second pass
+      // the agent spends one tick inside the wall before the next frame
+      // corrects it (the visible "graze and bounce" artifact).
+      if (anyExclusion && planner.isReady()) {
+        Ped::Tvector clamped = planner.clampToFreeSpace(p, p);
+        if ((clamped - p).lengthSquared() > 1e-12)
+          p = clamped;
+      }
+    }
+
     updateDirection();
   }
 
@@ -563,6 +645,77 @@ void Agent::move(double h) {
   emit positionChanged(getx(), gety());
   emit velocityChanged(getvx(), getvy());
   emit accelerationChanged(getax(), getay());
+}
+
+void Agent::planAndSetPath(const Ped::Tvector& goal)
+{
+    auto path = PedestrianPlanner::instance().planPath(p, goal);
+
+    {
+        static FILE* dbg = std::fopen("/tmp/pedsim_plan.log", "w");
+        if (dbg) {
+            std::fprintf(dbg, "PLAN agent=%s pos=(%.3g,%.3g) goal=(%.3g,%.3g) pathLen=%zu\n",
+                getId().c_str(), p.x, p.y, goal.x, goal.y, path.size());
+            if (!path.empty())
+                std::fprintf(dbg, "  p0=(%.3g,%.3g) p1=(%.3g,%.3g) pBack=(%.3g,%.3g)\n",
+                    path[0].x, path[0].y,
+                    path.size() > 1 ? path[1].x : 0.0,
+                    path.size() > 1 ? path[1].y : 0.0,
+                    path.back().x, path.back().y);
+            std::fflush(dbg);
+        }
+    }
+
+    if (path.empty()) {
+        if (!pathQueue_.empty()) {
+            // Still have a partial route — keep following it.
+            return;
+        }
+        // No path and no queue: destination is unreachable. Track consecutive
+        // failures; after kMaxPathFailures, skip this waypoint so the agent
+        // doesn't idle against an impassable goal forever (e.g. funnel trap,
+        // waypoint inside a wall). Until the threshold is reached, stand still
+        // so the agent doesn't spin trying to steer directly through a wall.
+        int& fails = pathFailCountByAgent[getId()];
+        fails++;
+        if (fails >= kMaxPathFailures) {
+            fails = 0;
+            updateDestination();  // advance to next waypoint in the cycle
+            hasPathSubGoal = false;
+        } else {
+            hasPathSubGoal = true;
+            pathSubGoal    = p;
+        }
+        return;
+    }
+    pathFailCountByAgent[getId()] = 0;  // reset on success
+    pathQueue_.clear();
+    hasPathSubGoal = false;
+    for (std::size_t i = 1; i < path.size(); i++)
+        pathQueue_.push_back(path[i]);
+
+    // snapToSafe() may place the A* start behind the agent (it snaps to the
+    // nearest clearance-safe cell, not necessarily the one ahead). The leading
+    // waypoints in the queue would then be behind the agent, causing a 180-degree
+    // turn. Find the queue entry closest to the current position and drop every-
+    // thing before it — the remaining tail routes correctly toward the goal.
+    if (pathQueue_.size() > 1) {
+        std::size_t closest = 0;
+        double closestDist = (pathQueue_[0] - p).lengthSquared();
+        for (std::size_t i = 1; i < pathQueue_.size(); i++) {
+            double d = (pathQueue_[i] - p).lengthSquared();
+            if (d < closestDist) { closestDist = d; closest = i; }
+        }
+        if (closest > 0)
+            pathQueue_.erase(pathQueue_.begin(),
+                             pathQueue_.begin() + static_cast<std::ptrdiff_t>(closest));
+    }
+}
+
+void Agent::clearPath()
+{
+    pathQueue_.clear();
+    hasPathSubGoal = false;
 }
 
 const QList<Waypoint*>& Agent::getWaypoints() const { return destinations; }
@@ -635,6 +788,16 @@ bool Agent::removeForce(Force* forceIn) {
 }
 
 AgentStateMachine* Agent::getStateMachine() const { return stateMachine; }
+
+std::string Agent::getSocialState() const {
+  if(isSocialStateOverridden) return socialStateOverride;
+  return AgentStateMachine::stateToName(stateMachine->getCurrentState()).toStdString();
+}
+
+void Agent::overrideSocialState(std::string state_){
+  isSocialStateOverridden = true;
+  socialStateOverride = state_;
+}
 
 WaypointPlanner* Agent::getWaypointPlanner() const { return waypointplanner; }
 
@@ -999,7 +1162,7 @@ void Agent::recordVelocity() {
     lastRecordedVelocityTime = ros::Time::now();
 
     recordedVelocitiesIndex = (recordedVelocitiesIndex + 1) % numRecordedVelocities;
-    recordedVelocities[recordedVelocitiesIndex] = v.lengthSquared();
+    recordedVelocities[recordedVelocitiesIndex] = v.length();
     velocitiesRecorded++;
   }
 }

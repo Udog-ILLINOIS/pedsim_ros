@@ -1,6 +1,6 @@
-import enum
 import os
 from typing import Dict, List, Tuple
+import typing
 
 import numpy as np
 import genpy
@@ -9,8 +9,8 @@ import rospy
 import pedsim_msgs.msg
 
 from pedsim_agents.config import Topics
-from pedsim_agents.utils import InputData, FeedbackData, FeedbackDatum, SemanticMsg, SemanticData, SemanticAttribute, PedType
-
+from pedsim_agents.utils import InData, WorkData, SemanticMsg, SemanticData, SemanticAttribute
+from pedsim_agents.states.main import _agent_to_index
 
 class SemanticProcessor:
 
@@ -23,31 +23,34 @@ class SemanticProcessor:
             queue_size = 1
         ) for attribute in SemanticAttribute}
 
-    def calculate(self, input_data: InputData, feedback_data: FeedbackData) -> SemanticData:
+    def calculate(self, in_data: InData, work_data: WorkData, states_data: typing.Collection[typing.Dict]) -> SemanticData:
         
         semantic_data: SemanticData = dict()
 
         for attribute in SemanticAttribute:
             semantic_data[attribute] = []
 
-        def get_attributes(state: pedsim_msgs.msg.AgentState, feedback: FeedbackDatum) -> List[Tuple[SemanticAttribute, float]]:
+        def get_attributes(agent_state: pedsim_msgs.msg.AgentState, force: np.ndarray) -> List[Tuple[SemanticAttribute, float]]:
             attributes: List[Tuple[SemanticAttribute, float]] = []
 
             attributes.append((SemanticAttribute.IS_PEDESTRIAN, 1))
 
-            if np.linalg.norm([feedback.feedback.force.x, feedback.feedback.force.y]) > 0.05:
+            if np.linalg.norm(force[:2]) > 0.05:
                 attributes.append((SemanticAttribute.IS_PEDESTRIAN_MOVING, 1))
 
-            attributes.append((SemanticAttribute.PEDESTRIAN_VEL_X, feedback.feedback.force.x))
-            attributes.append((SemanticAttribute.PEDESTRIAN_VEL_Y, feedback.feedback.force.y))
+            attributes.append((SemanticAttribute.PEDESTRIAN_VEL_X, float(force[0])))
+            attributes.append((SemanticAttribute.PEDESTRIAN_VEL_Y, float(force[1])))
 
-            attributes.append((SemanticAttribute.PEDESTRIAN_TYPE, PedType[str(state.type)].value))
+            attributes.append((SemanticAttribute.PEDESTRIAN_TYPE, _agent_to_index(agent_state.type)))
 
             return attributes
         
-        for state, feedback in zip(input_data.agents, feedback_data):
-            for attribute, intensity in get_attributes(state, feedback):
-                semantic_data[attribute].append((state.pose.position, intensity))
+        for in_, work_, state in zip(in_data.agents, work_data.force, states_data):
+            for attribute, intensity in get_attributes(in_, work_):
+                semantic_data[attribute].append((in_.pose.position, intensity))
+
+            for state_attribute, state_value in state.items():
+                semantic_data[state_attribute].append((in_.pose.position, state_value))
 
         return semantic_data
 

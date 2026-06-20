@@ -66,6 +66,13 @@ class LIBEXPORT Tagent {
   virtual Tvector obstacleForce();
   virtual Tvector myForce(Tvector desired);
   virtual Twaypoint* getCurrentWaypoint() const = 0;
+  virtual Tvector getFreshForce();
+
+  // Applies a committed-side robot bypass using a robot position supplied by
+  // the simulator layer. Returns true when this method handled movement for
+  // the current tick. The implementation lives in ped_agent.cpp.
+  bool applyExternalRobotAvoidance(const Tvector& robotPosition,
+                                   double stepSizeIn);
 
   virtual void setPosition(double px, double py, double pz = 0);
   virtual void setType(AgentType typeIn) { type = typeIn; };
@@ -77,7 +84,7 @@ class LIBEXPORT Tagent {
 
   pedsim::id getId() const { return id; };
   AgentType getType() const { return type; };
-  double getVmax() const { return vmax; };
+  double getVmax() const { return vmax * factorVmax; };
   double getRelaxationTime() const { return relaxationTime; };
   bool getTeleop() { return teleop; }
   double getRobotPosDiffScalingFactor() const { return robotPosDiffScalingFactor; };
@@ -130,9 +137,12 @@ class LIBEXPORT Tagent {
   double forceFactorSocial;
   double forceFactorObstacle;
   double forceFactorRobot;
+  std::string configuration;
 
   void overrideForce();
   void overrideForce(Ped::Tvector pose);
+
+  void overrideVmax(double factor_);
 
  protected:
   Tvector p;  ///< current position of the agent
@@ -152,6 +162,10 @@ class LIBEXPORT Tagent {
 
   Ped::Tscene* scene;
 
+  // Subclasses can call this after directly modifying p to keep the spatial
+  // hash consistent. Defined in ped_agent.cpp where Tscene is complete.
+  void syncScenePosition();
+
   Ped::Tvector desiredDirection;
   set<const Ped::Tagent*> neighbors;
 
@@ -164,6 +178,14 @@ class LIBEXPORT Tagent {
 
   Ped::Tvector forceOverride;
   bool isForceOverridden = false;
+
+  double factorVmax = 1.f;
+
+  // Set by the Agent layer when a global path sub-goal is active.
+  // move() and applyExternalRobotAvoidance() use this to override the
+  // waypoint direction produced by desiredForce().
+  Ped::Tvector pathSubGoal;
+  bool         hasPathSubGoal = false;
 };
 }
 #endif

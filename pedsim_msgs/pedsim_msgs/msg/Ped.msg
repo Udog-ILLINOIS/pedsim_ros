@@ -38,4 +38,4 @@ float64 force_factor_robot
 geometry_msgs/Point[] waypoints
 int16 waypoint_mode
 
-
+string configuration

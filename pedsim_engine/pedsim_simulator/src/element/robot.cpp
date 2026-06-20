@@ -16,6 +16,7 @@ Robot::~Robot() {
 
 void Robot::_callbackOdom(boost::shared_ptr< ::nav_msgs::Odometry const> msg){
     this->state.pose = msg->pose.pose;
+    this->state.twist = msg->twist.twist;
 }
 
 pedsim_msgs::RobotState Robot::getState(){
